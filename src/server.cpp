@@ -6,11 +6,10 @@
 #include <ifaddrs.h>
 #include <net/if.h>
 #include <netdb.h>
-#include <iostream>
 #include <cstring>
 
 Server::Server(Visibility visibility_level)
-        : port(DEFAULT_PORT), server_socket(-1), running(false), visibility(visibility_level), bind_address(LOCALHOST) {
+        : port(DEFAULT_PORT), server_socket(-1), bind_address(std::string(LOCALHOST)), running(false), client_threads() {
     configure_visibility(visibility_level, "", false);
 }
 
@@ -19,26 +18,24 @@ Server::~Server() {
 }
 
 bool Server::configure_visibility(Visibility visibility_level, const std::string &address, bool log_info) {
-    visibility = visibility_level;
     switch (visibility_level) {
-        case Visibility::LocalMachine:
-            bind_address = LOCALHOST;
-            if (log_info) std::cout << INFO_VISIBILITY_SET << "LocalMachine on " << bind_address << "." << std::endl;
+        case LocalMachine:
+            bind_address = std::string(LOCALHOST);
+            if (log_info) std::cout << INFO_VISIBILITY_SET << "LocalMachine on " << bind_address << ".\n";
             break;
-        case Visibility::Global:
-            bind_address = GLOBAL;
-            if (log_info) std::cout << INFO_VISIBILITY_SET << "Global on all interfaces." << std::endl;
+        case Global:
+            bind_address = std::string(GLOBAL);
+            if (log_info) std::cout << INFO_VISIBILITY_SET << "Global on all interfaces.\n";
             break;
-        case Visibility::Subnet:
-        case Visibility::Network:
+        case Subnet:
+        case Network:
             bind_address = address.empty() ? get_primary_ip() : address;
             if (bind_address.empty()) {
-                std::cerr << ERR_BIND_FAILED << " - Could not determine IP for network visibility." << std::endl;
+                std::cerr << ERR_BIND_FAILED << " - Could not determine IP for network visibility.\n";
                 return false;
             }
-            if (log_info) std::cout << INFO_VISIBILITY_SET
-                                    << (visibility_level == Visibility::Subnet ? "Subnet" : "Network")
-                                    << " on " << bind_address << "." << std::endl;
+            if (log_info) std::cout << INFO_VISIBILITY_SET << (visibility_level == Subnet ? "Subnet" : "Network")
+                                    << " on " << bind_address << ".\n";
             break;
         default:
             std::cerr << ERR_INVALID_VISIBILITY << std::endl;
@@ -47,16 +44,15 @@ bool Server::configure_visibility(Visibility visibility_level, const std::string
     return true;
 }
 
-std::string Server::get_primary_ip() const {
-    struct ifaddrs *ifAddr, *ifa;
-    std::string primary_ip;
-
+std::string Server::get_primary_ip() {
+    struct ifaddrs *ifAddr;
     if (getifaddrs(&ifAddr) == -1) return "";
 
-    for (ifa = ifAddr; ifa != nullptr; ifa = ifa->ifa_next) {
+    std::string primary_ip;
+    for (struct ifaddrs *ifa = ifAddr; ifa != nullptr; ifa = ifa->ifa_next) {
         if (ifa->ifa_addr && ifa->ifa_addr->sa_family == AF_INET && !(ifa->ifa_flags & IFF_LOOPBACK)) {
-            char host[NI_MAXHOST];
-            if (getnameinfo(ifa->ifa_addr, sizeof(struct sockaddr_in), host, NI_MAXHOST, nullptr, 0, NI_NUMERICHOST) == 0) {
+            std::string host(NI_MAXHOST, '\0');
+            if (getnameinfo(ifa->ifa_addr, sizeof(struct sockaddr_in), host.data(), static_cast<socklen_t>(host.size()), nullptr, 0, NI_NUMERICHOST) == 0) {
                 primary_ip = host;
                 break;
             }
@@ -66,6 +62,7 @@ std::string Server::get_primary_ip() const {
     return primary_ip;
 }
 
+
 bool Server::start_server(int port) {
     this->port = port;
     running = true;
@@ -74,10 +71,9 @@ bool Server::start_server(int port) {
 
 void Server::run() {
     if (!running) {
-        std::cerr << "[ERROR] Server is not running." << std::endl;
+        std::cerr << "[ERROR] Server is not running.\n";
         return;
     }
-
     std::cout << INFO_SERVER_RUNNING << std::endl;
 
     while (running) {
@@ -95,8 +91,7 @@ bool Server::bind_socket() {
         return false;
     }
 
-    int opt = 1;
-    if (setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+    if (int opt = 1; setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
         std::cerr << ERR_SOCKET_OPTIONS << ": " << strerror(errno) << std::endl;
         return false;
     }
@@ -113,7 +108,7 @@ bool Server::bind_socket() {
     return true;
 }
 
-bool Server::listen_socket() {
+bool Server::listen_socket() const {
     if (listen(server_socket, BACKLOG_QUEUE) < 0) {
         std::cerr << ERR_LISTEN_FAILED << ": " << strerror(errno) << std::endl;
         return false;
@@ -128,7 +123,7 @@ int Server::accept_client() {
     int client_socket = accept(server_socket, (struct sockaddr *)&client_addr, &client_addr_len);
 
     if (client_socket >= 0) {
-        std::lock_guard<std::mutex> lock(client_mutex);
+        std::scoped_lock lock(client_mutex);
         client_addresses[client_socket] = inet_ntoa(client_addr.sin_addr);
     } else {
         std::cerr << ERR_ACCEPT_FAILED << ": " << strerror(errno) << std::endl;
@@ -136,20 +131,21 @@ int Server::accept_client() {
     return client_socket;
 }
 
-void Server::client_thread(int client_socket) {
-    while (running && handle_client(client_socket)) {}
+void Server::client_thread(int client_socket, std::stop_token stoken) {
+    while (!stoken.stop_requested() && handle_client(client_socket))
     {
-        std::lock_guard<std::mutex> lock(client_mutex);
+        std::scoped_lock lock(client_mutex);
         client_addresses.erase(client_socket);
     }
-    close(client_socket);
+
+    close(client_socket);  // Close the client socket after handling it.
 }
 
+
 bool Server::handle_client(int client_socket) {
-    char buffer[MAX_BUFFER_SIZE] = {0};
-    ssize_t bytes_read = recv(client_socket, buffer, sizeof(buffer) - 1, 0);
-    if (bytes_read > 0) {
-        send(client_socket, buffer, bytes_read, 0);
+    std::vector<char> buffer(MAX_BUFFER_SIZE);
+    if (ssize_t bytes_read = recv(client_socket, buffer.data(), buffer.size() - 1, 0); bytes_read > 0) {
+        send(client_socket, buffer.data(), bytes_read, 0);
     } else {
         std::cerr << INFO_CLIENT_DISCONNECT << std::endl;
         return false;
@@ -162,29 +158,30 @@ void Server::stop_server() {
     running = false;
 
     std::cout << INFO_STOPPING_SERVER << std::endl;
-
     clean_up();
 
-    for (std::thread &t : client_threads) {
-        if (t.joinable()) t.join();
+    for (std::jthread &t : client_threads) {
+        if (t.joinable()) t.request_stop();
     }
-
     std::cout << INFO_SERVER_STOPPED << std::endl;
 }
 
 bool Server::clean_up() {
-    std::lock_guard<std::mutex> lock(client_mutex);
+    std::scoped_lock lock(client_mutex);
 
     for (const auto &[client_socket, client_ip] : client_addresses) {
-        std::cout << "[INFO] Closing connection with client " << client_ip << " (socket " << client_socket << ")." << std::endl;
+        std::cout << "[INFO] Closing connection for client: " << client_ip << std::endl;
         close(client_socket);
     }
     client_addresses.clear();
 
-    if (server_socket >= 0) {
-        std::cout << "[INFO] Closing main server socket " << server_socket << "." << std::endl;
+    if (server_socket != -1) {
         close(server_socket);
         server_socket = -1;
     }
     return true;
+}
+
+bool Server::is_running() const {
+    return running;
 }
